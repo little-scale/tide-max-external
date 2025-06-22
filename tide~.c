@@ -1,468 +1,278 @@
 /**
- * tide~ - Simplified Tides-based LFO Max External
- * 
- * Implements the core waveshaping algorithm from Mutable Instruments Tides 2,
- * simplified to a single LFO output with Tides' unique asymmetric ramps,
- * shape controls, and smoothness processing.
- * 
- * Features:
- * - Asymmetric ramp generator with variable slope (attack/decay ratio)
- * - 5 morphable shapes (linear, exponential, logarithmic, sine, arc-sine)
- * - Smoothness processing (2-pole LPF or wavefolder)
- * - Three ramp modes: AD (one-shot), Loop (continuous), AR (attack-release)
- */
+    @file
+    tide~: Mutable Instruments Tides-based LFO/envelope generator external
+    Implements the authentic Tides 2 PolySlopeGenerator algorithm
+    @ingroup examples
+*/
 
-#include "ext.h"
-#include "ext_obex.h"
-#include "z_dsp.h"
-#include <math.h>
+#include "ext.h"        // standard Max include, always required
+#include "ext_obex.h"   // required for "new" style objects
+#include "z_dsp.h"      // required for MSP objects
 
-// Constants
-#define SHAPE_TABLE_SIZE 1024
-#define NUM_SHAPES 5
-#define PI 3.14159265358979323846
+// Forward declaration for C++ Tides interface
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-// Envelope modes
-#define MODE_AD 0     // Attack-Decay (one-shot)
-#define MODE_LOOP 1   // Loop (continuous)
-#define MODE_AR 2     // Attack-Release (gate)
+// C wrapper functions for Tides C++ code
+void* tides_create(void);
+void tides_destroy(void* tides_obj);
+void tides_init(void* tides_obj);
+void tides_render(void* tides_obj, int ramp_mode, int output_mode, int range,
+                  float frequency, float pw, float shape, float smoothness, float shift,
+                  unsigned char gate_flags, float* output);
 
-// Envelope stages
-#define STAGE_IDLE 0
-#define STAGE_ATTACK 1
-#define STAGE_DECAY 2
+#ifdef __cplusplus
+}
+#endif
 
-// External object structure
-typedef struct _tide {
-    t_pxobject x_obj;
+// struct to represent the object's state
+typedef struct _tide
+{
+    t_pxobject ob;                  // the object itself (t_pxobject for MSP)
     
-    // Core state
-    double phase;           // 0.0 to 1.0
-    double frequency;       // Hz
-    double sr;             // Sample rate
-    double sr_recip;       // 1/sr
+    // Tides DSP object (opaque pointer to C++ object)
+    void* poly_slope_generator;
     
-    // Ramp generation
-    int ramp_mode;         // 0=AD, 1=Loop, 2=AR
-    int envelope_stage;    // 0=idle, 1=attack, 2=decay/release
-    double prev_trig;      // For edge detection
-    int gate_high;         // For AR mode sustain
     
-    // Parameters (all 0-1 range, except frequency)
-    double slope;          // Attack/decay ratio (0=fast attack, 1=fast decay)
-    double shape_param;    // Morph between shape curves
-    double smooth_param;   // Filter cutoff or fold amount
+    // Float parameters for control (set via messages)
+    double frequency_float;         // Frequency in Hz
+    double shape_float;             // Shape parameter (0-1)
+    double slope_float;             // Slope parameter (0-1, was called 'pw' in Tides)
+    double smooth_float;            // Smoothness parameter (0-1)
+    double phase_float;             // Phase offset (0-1)
+    double freq_scale;              // Frequency scaling factor
     
-    // Float parameter storage for when no signal is connected
-    double frequency_float; // Float value for frequency parameter
-    double shape_float;     // Float value for shape parameter
-    double smooth_float;    // Float value for smoothness parameter
+    // Signal connection status (following lores~ pattern)
+    short freq_has_signal;          // 1 if frequency inlet has signal connection
+    short shape_has_signal;         // 1 if shape inlet has signal connection
+    short slope_has_signal;         // 1 if slope inlet has signal connection
+    short smooth_has_signal;        // 1 if smooth inlet has signal connection
+    short phase_has_signal;         // 1 if phase inlet has signal connection
     
-    // Connection status for inlets
-    int freq_has_signal;    // Whether frequency inlet has signal connected
-    int shape_has_signal;   // Whether shape inlet has signal connected
-    int smooth_has_signal;  // Whether smoothness inlet has signal connected
     
-    // Waveshaping lookup tables
-    double shape_lut[NUM_SHAPES][SHAPE_TABLE_SIZE];
+    // Gate flags (unused in loop mode but needed for Tides interface)
+    unsigned char gate_flags;       // Tides gate flags
     
-    // Filter states for smoothness processing
-    double lpf_z1, lpf_z2;      // 2-pole filter states
-    
-    // Inlet number for float message routing
-    long m_inletnum;            // Current inlet number
+    // Sample rate
+    double sample_rate;
     
 } t_tide;
 
-// Function prototypes
-void *tide_new(t_symbol *s, long argc, t_atom *argv);
-void tide_free(t_tide *x);
-void tide_assist(t_tide *x, void *b, long m, long a, char *s);
-void tide_dsp64(t_tide *x, t_object *dsp64, short *count, double samplerate, long maxvectorsize, long flags);
-void tide_perform64(t_tide *x, t_object *dsp64, double **ins, long numins, double **outs, long numouts, long sampleframes, long flags, void *userparam);
+// Method prototypes
+void* tide_new(t_symbol* s, long argc, t_atom* argv);
+void tide_free(t_tide* x);
+void tide_assist(t_tide* x, void* b, long m, long a, char* s);
+void tide_float(t_tide* x, double f);
+void tide_dsp64(t_tide* x, t_object* dsp64, short* count, double samplerate, long maxvectorsize, long flags);
+void tide_perform64(t_tide* x, t_object* dsp64, double** ins, long numins, double** outs, long numouts, long sampleframes, long flags, void* userparam);
 
-// Message handlers
-void tide_frequency(t_tide *x, double f);
-void tide_slope(t_tide *x, double s);
-void tide_mode(t_tide *x, long m);
-void tide_trigger(t_tide *x);          // Trigger method for envelope modes
-void tide_float(t_tide *x, double f);  // Float handler for inlet routing
 
-// DSP utility functions
-void tide_init_shapes(t_tide *x);
-void tide_advance_phase(t_tide *x);
-double tide_apply_shape(t_tide *x, double phase, double shape_param);
-double tide_apply_smoothness(t_tide *x, double input, double smooth_param);
+// Global class pointer variable
+static t_class* tide_class = NULL;
 
-// Class pointer
-static t_class *tide_class;
+//----------------------------------------------------------------------------------------------
 
-//--------------------------------------------------------------------------
+void ext_main(void* r)
+{
+    // Object creation
+    t_class* c = class_new("tide~", (method)tide_new, (method)tide_free, (long)sizeof(t_tide), 0L, A_GIMME, 0);
 
-void ext_main(void *r) {
-    t_class *c = class_new("tide~", (method)tide_new, (method)tide_free, 
-                          (long)sizeof(t_tide), 0L, A_GIMME, 0);
-    
+    class_addmethod(c, (method)tide_float, "float", A_FLOAT, 0);
     class_addmethod(c, (method)tide_dsp64, "dsp64", A_CANT, 0);
     class_addmethod(c, (method)tide_assist, "assist", A_CANT, 0);
     
-    // Message handlers
-    class_addmethod(c, (method)tide_frequency, "frequency", A_FLOAT, 0);
-    class_addmethod(c, (method)tide_slope, "slope", A_FLOAT, 0);
-    class_addmethod(c, (method)tide_mode, "mode", A_LONG, 0);
-    class_addmethod(c, (method)tide_trigger, "trigger", 0);
-    class_addmethod(c, (method)tide_trigger, "bang", 0);  // Also respond to bang
-    class_addmethod(c, (method)tide_float, "float", A_FLOAT, 0);
+    // Add frequency scaling attribute
+    CLASS_ATTR_DOUBLE(c, "freqscale", 0, t_tide, freq_scale);
+    CLASS_ATTR_FILTER_MIN(c, "freqscale", 0.0001);
+    CLASS_ATTR_FILTER_MAX(c, "freqscale", 1.0);
+    CLASS_ATTR_DEFAULT(c, "freqscale", 0, "1.0");
+    CLASS_ATTR_LABEL(c, "freqscale", 0, "Frequency Scale");
+    CLASS_ATTR_SAVE(c, "freqscale", 0);
     
     class_dspinit(c);
+
+
     class_register(CLASS_BOX, c);
     tide_class = c;
 }
 
-//--------------------------------------------------------------------------
+//----------------------------------------------------------------------------------------------
 
-void *tide_new(t_symbol *s, long argc, t_atom *argv) {
-    t_tide *x = (t_tide *)object_alloc(tide_class);
-    
+void* tide_new(t_symbol* s, long argc, t_atom* argv)
+{
+    t_tide* x = (t_tide*)object_alloc(tide_class);
+
     if (x) {
-        // Initialize DSP with 3 signal inlets: frequency, shape, smoothness
-        dsp_setup((t_pxobject *)x, 3);
-        
-        // Create audio outlet
-        outlet_new(x, "signal");
-        
+        dsp_setup((t_pxobject*)x, 5);  // 5 inlets: freq, shape, slope, smooth, phase
+        outlet_new(x, "signal");        // 1 outlet: waveform
+
+
+        // Create Tides C++ object
+        x->poly_slope_generator = tides_create();
+        if (x->poly_slope_generator) {
+            tides_init(x->poly_slope_generator);
+        }
+
         // Initialize parameters with defaults
-        x->frequency = 1.0;         // 1 Hz default
-        x->slope = 0.5;             // Symmetric ramp
-        x->ramp_mode = MODE_LOOP;   // Continuous looping
-        x->envelope_stage = STAGE_IDLE;
-        x->phase = 0.0;
-        x->prev_trig = 0.0;
-        x->gate_high = 0;
-        
-        // Initialize parameter storage
-        x->shape_param = 0.0;       // Linear shape
-        x->smooth_param = 0.0;      // No smoothness
-        
-        // Initialize float parameter storage
-        x->frequency_float = 1.0;   // Default 1 Hz frequency
-        x->shape_float = 0.0;       // Default linear shape
-        x->smooth_float = 0.0;      // Default no smoothness
+        x->frequency_float = 1.0;       // 1 Hz
+        x->shape_float = 0.0;           // Linear
+        x->slope_float = 0.5;           // Balanced attack/decay
+        x->smooth_float = 0.0;          // No smoothing
+        x->phase_float = 0.0;           // No phase offset
+        x->freq_scale = 1.0;            // Default to 1.0 (no scaling)
         
         // Initialize connection status (assume no signals connected initially)
         x->freq_has_signal = 0;
         x->shape_has_signal = 0;
+        x->slope_has_signal = 0;
         x->smooth_has_signal = 0;
+        x->phase_has_signal = 0;
         
-        // Initialize filter states
-        x->lpf_z1 = 0.0;
-        x->lpf_z2 = 0.0;
-        
-        // Initialize waveshaping lookup tables
-        tide_init_shapes(x);
-        
-        // Process arguments: [frequency] [slope] [mode]
-        if (argc >= 1 && atom_gettype(argv) == A_FLOAT) {
-            x->frequency = CLAMP(atom_getfloat(argv), 0.001, 100.0);
-        }
-        if (argc >= 2 && atom_gettype(argv + 1) == A_FLOAT) {
-            x->slope = CLAMP(atom_getfloat(argv + 1), 0.001, 0.999);
-        }
-        if (argc >= 3 && atom_gettype(argv + 2) == A_LONG) {
-            x->ramp_mode = CLAMP(atom_getlong(argv + 2), 0, 2);
-        }
+        x->gate_flags = 0;
+        x->sample_rate = 44100.0;
+
+        // Process attributes
+        attr_args_process(x, argc, argv);
     }
-    
+
     return x;
 }
 
-void tide_free(t_tide *x) {
-    dsp_free((t_pxobject *)x);
+//----------------------------------------------------------------------------------------------
+
+void tide_free(t_tide* x)
+{
+    if (x->poly_slope_generator) {
+        tides_destroy(x->poly_slope_generator);
+    }
+    
+    
+    dsp_free((t_pxobject*)x);
 }
 
-void tide_assist(t_tide *x, void *b, long m, long a, char *s) {
+//----------------------------------------------------------------------------------------------
+
+void tide_assist(t_tide* x, void* b, long m, long a, char* s)
+{
     if (m == ASSIST_INLET) {
         switch (a) {
-            case 0: sprintf(s, "frequency Hz (signal/float)"); break;
-            case 1: sprintf(s, "shape 0-1 (signal/float): morphs between curves"); break;
-            case 2: sprintf(s, "smoothness 0-1 (signal/float): filter/folder"); break;
+            case 0: strcpy(s, "(signal/float) Frequency (Hz)"); break;
+            case 1: strcpy(s, "(signal/float) Shape (0-1)"); break;
+            case 2: strcpy(s, "(signal/float) Slope (0-1)"); break;
+            case 3: strcpy(s, "(signal/float) Smooth (0-1)"); break;
+            case 4: strcpy(s, "(signal/float) Phase (0-1)"); break;
         }
-    } else {
-        sprintf(s, "LFO output signal");
+    }
+    else {
+        strcpy(s, "(signal) Waveform Output");
     }
 }
 
-//--------------------------------------------------------------------------
-// Message handlers
+//----------------------------------------------------------------------------------------------
 
-void tide_frequency(t_tide *x, double f) {
-    x->frequency = CLAMP(f, 0.001, 100.0);
-}
-
-void tide_slope(t_tide *x, double s) {
-    x->slope = CLAMP(s, 0.001, 0.999);  // Prevent division by zero
-}
-
-void tide_mode(t_tide *x, long m) {
-    x->ramp_mode = CLAMP(m, 0, 2);
-    // Reset envelope state when changing modes
-    if (x->ramp_mode != MODE_LOOP) {
-        x->envelope_stage = STAGE_IDLE;
-        x->phase = 0.0;
-    }
-}
-
-void tide_trigger(t_tide *x) {
-    // Trigger envelope for AD and AR modes
-    if (x->ramp_mode != MODE_LOOP) {
-        x->phase = 0.0;
-        x->envelope_stage = STAGE_ATTACK;
-    }
-}
-
-void tide_float(t_tide *x, double f) {
-    long inlet = ((t_pxobject *)x)->z_in;
+void tide_float(t_tide* x, double f)
+{
+    // Route float messages to specific inlets
+    long inlet = proxy_getinlet((t_object*)x);
+    
     switch (inlet) {
-        case 0:  // Frequency inlet
-            x->frequency_float = CLAMP(f, 0.001, 100.0);
+        case 0: 
+            x->frequency_float = CLAMP(f, 0.000001, 1000.0);  // Allow down to 0.000001 Hz
             break;
-        case 1:  // Shape inlet
+        case 1: 
             x->shape_float = CLAMP(f, 0.0, 1.0);
             break;
-        case 2:  // Smoothness inlet  
+        case 2: 
+            x->slope_float = CLAMP(f, 0.0, 1.0);
+            break;
+        case 3: 
             x->smooth_float = CLAMP(f, 0.0, 1.0);
+            break;
+        case 4: 
+            x->phase_float = CLAMP(f, 0.0, 1.0);
             break;
     }
 }
 
-//--------------------------------------------------------------------------
-// DSP setup and processing
+//----------------------------------------------------------------------------------------------
 
-void tide_dsp64(t_tide *x, t_object *dsp64, short *count, double samplerate, long maxvectorsize, long flags) {
-    x->sr = samplerate;
-    x->sr_recip = 1.0 / samplerate;
+
+//----------------------------------------------------------------------------------------------
+
+void tide_dsp64(t_tide* x, t_object* dsp64, short* count, double samplerate, long maxvectorsize, long flags)
+{
+    x->sample_rate = samplerate;
     
-    // Check which inlets have signals connected
-    x->freq_has_signal = count[0];     // Inlet 0: frequency
-    x->shape_has_signal = count[1];    // Inlet 1: shape
-    x->smooth_has_signal = count[2];   // Inlet 2: smoothness
+    // Store signal connection status (following lores~ pattern)
+    x->freq_has_signal = count[0];
+    x->shape_has_signal = count[1]; 
+    x->slope_has_signal = count[2];
+    x->smooth_has_signal = count[3];
+    x->phase_has_signal = count[4];
     
     object_method(dsp64, gensym("dsp_add64"), x, tide_perform64, 0, NULL);
 }
 
-void tide_perform64(t_tide *x, t_object *dsp64, double **ins, long numins, 
-                    double **outs, long numouts, long sampleframes, 
-                    long flags, void *userparam) {
-    double *freq_in = ins[0];
-    double *shape_in = ins[1];
-    double *smooth_in = ins[2];
-    double *out = outs[0];
-    
-    for (int i = 0; i < sampleframes; i++) {
-        // Use signal input if connected, otherwise use float parameter
-        double frequency = x->freq_has_signal ? CLAMP(freq_in[i], 0.001, 100.0) : x->frequency_float;
-        double shape = x->shape_has_signal ? CLAMP(shape_in[i], 0.0, 1.0) : x->shape_float;
-        double smooth = x->smooth_has_signal ? CLAMP(smooth_in[i], 0.0, 1.0) : x->smooth_float;
-        
-        // Update frequency for this sample
-        x->frequency = frequency;
-        
-        // Advance phase
-        tide_advance_phase(x);
-        
-        // Generate output
-        double output = 0.0;
-        
-        if (x->envelope_stage != STAGE_IDLE || x->ramp_mode == MODE_LOOP) {
-            // Apply shape transformation
-            output = tide_apply_shape(x, x->phase, shape);
-            
-            // Apply smoothness processing
-            output = tide_apply_smoothness(x, output, smooth);
+//----------------------------------------------------------------------------------------------
+
+void tide_perform64(t_tide* x, t_object* dsp64, double** ins, long numins, double** outs, long numouts, long sampleframes, long flags, void* userparam)
+{
+    // Input buffers for all 5 inlets
+    double* freq_in = ins[0];
+    double* shape_in = ins[1];
+    double* slope_in = ins[2];
+    double* smooth_in = ins[3];
+    double* phase_in = ins[4];
+
+    // Output buffer
+    double* out = outs[0];
+
+    // Check if Tides object exists
+    if (!x->poly_slope_generator) {
+        // Output silence if Tides object failed to create
+        for (long i = 0; i < sampleframes; i++) {
+            out[i] = 0.0;
         }
-        
-        out[i] = output;
+        return;
     }
-}
 
-//--------------------------------------------------------------------------
-// Shape lookup table generation
+    // Process each sample
+    for (long i = 0; i < sampleframes; i++) {
+        // Choose signal vs float for each inlet (following lores~ pattern)
+        double current_freq = x->freq_has_signal ? freq_in[i] : x->frequency_float;
+        current_freq *= x->freq_scale;  // Apply frequency scaling
+        double current_shape = x->shape_has_signal ? shape_in[i] : x->shape_float;
+        double current_slope = x->slope_has_signal ? slope_in[i] : x->slope_float;
+        double current_smooth = x->smooth_has_signal ? smooth_in[i] : x->smooth_float;
+        double current_phase = x->phase_has_signal ? phase_in[i] : x->phase_float;
 
-void tide_init_shapes(t_tide *x) {
-    for (int i = 0; i < SHAPE_TABLE_SIZE; i++) {
-        double phase = i / (double)(SHAPE_TABLE_SIZE - 1);
-        
-        // Linear (no shaping)
-        x->shape_lut[0][i] = phase;
-        
-        // Exponential (fast start, slow end)
-        x->shape_lut[1][i] = 1.0 - exp(-5.0 * phase);
-        x->shape_lut[1][i] /= (1.0 - exp(-5.0)); // Normalize
-        
-        // Logarithmic (slow start, fast end)
-        x->shape_lut[2][i] = log(1.0 + 9.0 * phase) / log(10.0);
-        
-        // Sine (smooth S-curve)
-        x->shape_lut[3][i] = sin(phase * PI * 0.5);
-        
-        // Arc-sine (inverse S-curve)
-        if (phase < 0.999) {
-            x->shape_lut[4][i] = asin(phase) / (PI * 0.5);
-        } else {
-            x->shape_lut[4][i] = 1.0;
-        }
-    }
-}
+        // Convert frequency from Hz to normalized phase increment per sample
+        float norm_frequency = (float)(current_freq / x->sample_rate);
+        norm_frequency = CLAMP(norm_frequency, 0.0f, 0.5f);  // Remove lower limit
 
-//--------------------------------------------------------------------------
-// Phase accumulator with asymmetric slope
+        // No gate detection needed for loop mode - just clear flags
+        x->gate_flags = 0;
 
-void tide_advance_phase(t_tide *x) {
-    double phase_increment = x->frequency * x->sr_recip;
-    
-    if (x->ramp_mode == MODE_LOOP) {
-        // Continuous looping
-        if (x->phase < x->slope) {
-            // Rising phase (attack)
-            x->phase += phase_increment / x->slope;
-        } else {
-            // Falling phase (decay)
-            x->phase += phase_increment / (1.0 - x->slope);
-        }
-        
-        if (x->phase >= 1.0) {
-            x->phase -= 1.0;
-        }
-    } else {
-        // Envelope modes (AD or AR)
-        if (x->envelope_stage == STAGE_ATTACK) {
-            x->phase += phase_increment / x->slope;
-            if (x->phase >= 1.0) {
-                x->phase = 1.0;
-                x->envelope_stage = STAGE_DECAY;
-            }
-        } else if (x->envelope_stage == STAGE_DECAY) {
-            if (x->ramp_mode == MODE_AR && x->gate_high) {
-                // Hold at sustain
-                x->phase = 1.0;
-            } else {
-                // Decay/Release
-                x->phase -= phase_increment / (1.0 - x->slope);
-                if (x->phase <= 0.0) {
-                    x->phase = 0.0;
-                    x->envelope_stage = STAGE_IDLE;
-                }
-            }
-        }
-    }
-}
+        // Prepare output buffer for Tides (4 channels, we use first)
+        float tides_output[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-//--------------------------------------------------------------------------
-// Shape interpolation and transformation
+        // Call Tides render function (Loop mode only)
+        tides_render(
+            x->poly_slope_generator,
+            1,                          // ramp_mode (1=Loop only) 
+            1,                          // output_mode (1=AMPLITUDE for standard waveform)
+            1,                          // range (1=AUDIO)
+            norm_frequency,             // frequency (normalized)
+            (float)current_slope,       // pw (pulse width/slope parameter)
+            (float)current_shape,       // shape
+            (float)current_smooth,      // smoothness
+            (float)current_phase,       // shift (phase offset)
+            x->gate_flags,              // gate flags
+            tides_output                // output buffer
+        );
 
-double tide_apply_shape(t_tide *x, double phase, double shape_param) {
-    // Determine if we're in attack or decay section
-    int rising = (phase < x->slope);
-    double normalized_phase;
-    
-    if (rising) {
-        normalized_phase = phase / x->slope;
-    } else {
-        normalized_phase = (phase - x->slope) / (1.0 - x->slope);
-    }
-    
-    // Clamp normalized phase
-    normalized_phase = CLAMP(normalized_phase, 0.0, 1.0);
-    
-    // Shape parameter selects between the 5 shapes
-    double shape_index = shape_param * (NUM_SHAPES - 1);
-    int shape_a = (int)shape_index;
-    int shape_b = shape_a + 1;
-    double shape_mix = shape_index - shape_a;
-    
-    if (shape_b >= NUM_SHAPES) shape_b = NUM_SHAPES - 1;
-    
-    // Table lookup with interpolation
-    double table_pos = normalized_phase * (SHAPE_TABLE_SIZE - 1);
-    int index = (int)table_pos;
-    double fract = table_pos - index;
-    
-    if (index >= SHAPE_TABLE_SIZE - 1) {
-        index = SHAPE_TABLE_SIZE - 1;
-        fract = 0.0;
-    }
-    
-    // Interpolate within each table
-    double val_a = x->shape_lut[shape_a][index] * (1.0 - fract) + 
-                   x->shape_lut[shape_a][index + 1] * fract;
-    double val_b = x->shape_lut[shape_b][index] * (1.0 - fract) + 
-                   x->shape_lut[shape_b][index + 1] * fract;
-    
-    // Mix between shapes
-    double result = val_a * (1.0 - shape_mix) + val_b * shape_mix;
-    
-    // Apply to attack or decay and convert to bipolar
-    if (rising) {
-        return result * 2.0 - 1.0;  // 0-1 -> -1 to +1 for attack
-    } else {
-        return (1.0 - result) * 2.0 - 1.0;  // Inverted for decay
-    }
-}
-
-//--------------------------------------------------------------------------
-// Smoothness processing: 2-pole LPF or wavefolder
-
-double tide_apply_smoothness(t_tide *x, double input, double smooth_param) {
-    if (smooth_param < 0.5) {
-        // Low-pass filter mode (0.0 to 0.5)
-        double cutoff_norm = smooth_param * 2.0;  // 0 to 1
-        
-        if (cutoff_norm < 0.01) {
-            // Bypass filter for very low values
-            return input;
-        }
-        
-        double cutoff_hz = 20.0 * pow(1000.0, cutoff_norm);  // 20Hz to 20kHz
-        
-        // Simple 2-pole Butterworth LPF
-        double omega = 2.0 * PI * cutoff_hz * x->sr_recip;
-        if (omega > PI) omega = PI;  // Nyquist limit
-        
-        double cos_omega = cos(omega);
-        double alpha = sin(omega) / sqrt(2.0);
-        
-        double b0 = (1.0 - cos_omega) / 2.0;
-        double b1 = 1.0 - cos_omega;
-        double b2 = b0;
-        double a0 = 1.0 + alpha;
-        double a1 = -2.0 * cos_omega;
-        double a2 = 1.0 - alpha;
-        
-        // Direct Form II
-        double w = input - (a1/a0) * x->lpf_z1 - (a2/a0) * x->lpf_z2;
-        double output = (b0/a0) * w + (b1/a0) * x->lpf_z1 + (b2/a0) * x->lpf_z2;
-        
-        x->lpf_z2 = x->lpf_z1;
-        x->lpf_z1 = w;
-        
-        return output;
-        
-    } else {
-        // Wavefolder mode (0.5 to 1.0)
-        double fold_amount = (smooth_param - 0.5) * 2.0;  // 0 to 1
-        double gain = 1.0 + fold_amount * 4.0;  // 1 to 5
-        
-        double folded = input * gain;
-        
-        // Folding algorithm - ensures output stays within -1 to +1
-        while (folded > 1.0 || folded < -1.0) {
-            if (folded > 1.0) {
-                folded = 2.0 - folded;
-            } else if (folded < -1.0) {
-                folded = -2.0 - folded;
-            }
-        }
-        
-        return folded;
+        // Output the first channel
+        out[i] = (double)tides_output[0];
     }
 }

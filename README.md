@@ -1,151 +1,166 @@
-# tide~ - Tides-inspired LFO External
+# tide~ - Mutable Instruments Tides LFO/Envelope External
 
-A Max/MSP external inspired by the core waveshaping algorithms from Mutable Instruments Tides 2, reimplemented as a single LFO output with unique asymmetric ramps, shape controls, and smoothness processing.
-
-## Credits and Inspiration
-
-**Inspired by**: [Mutable Instruments Tides](https://mutable-instruments.net/modules/tides/) by Émilie Gillet  
-**Original Design**: © Mutable Instruments 2013-2020  
-**This Implementation**: Educational/research purposes - original algorithmic interpretation  
-**No Direct Code**: This is a clean-room implementation based on published specifications
+A Max/MSP external inspired by Mutable Instruments Tides 2, implementing asymmetric ramp generation with authentic waveshaping and envelope capabilities. This external demonstrates advanced C++/C integration patterns for Max SDK development.
 
 ## Features
 
-### Core Waveshaping
-- **Asymmetric ramp generator** with variable slope (attack/decay ratio)
-- **5 morphable shapes**: linear, exponential, logarithmic, sine, arc-sine
-- **Smoothness processing**: 2-pole low-pass filter or wavefolder
-- **Three ramp modes**: AD (one-shot), Loop (continuous), AR (attack-release)
-
-### Signal Processing
-- **Frequency range**: 0.001 to 100 Hz
-- **Bipolar output**: -1 to +1 range for musical modulation
-- **Sample-accurate triggering**: Edge detection for envelope modes
-- **Universal binary**: Compatible with Intel and Apple Silicon Macs
+- **Asymmetric Ramp Generator**: Variable slope control for complex waveforms
+- **Shape Morphing**: Exponential, linear, and logarithmic curve types  
+- **Dual Smoothness**: Low-pass filtering (< 0.5) and triangle wavefolding (> 0.5)
+- **Three Ramp Modes**: AD (Attack-Decay), Loop (LFO), AR (Attack-Release)
+- **Signal/Float Dual Inlets**: All parameters accept both control and audio rate modulation
+- **Universal Binary**: Compatible with Intel and Apple Silicon Macs
+- **Self-Contained**: No external dependencies, simplified Tides recreation
 
 ## Inlets
 
-1. **Frequency** (signal/float) - LFO frequency in Hz (0.001-100)
-2. **Shape** (signal/float) - 0-1 morphs between wave shapes  
-3. **Smoothness** (signal/float) - 0-1 controls filter/folder amount
+1. **Frequency** (Hz) - Oscillation/envelope frequency (0.001 - 1000 Hz)
+2. **Trigger/Gate** - Trigger envelopes or gate for AR mode
+3. **Shape** (0-1) - Curve morphing: 0=exponential, 0.5=linear, 1=logarithmic
+4. **Slope** (0-1) - Attack/decay ratio: 0=fast attack, 1=fast decay
+5. **Smooth** (0-1) - Processing: 0-0.5=filtering, 0.5-1=wavefolding
 
-**Note**: All inlets accept both signal and float inputs. When a signal is connected, it takes priority over float messages. When no signal is connected, float messages control the parameter.
+## Outlets
 
-## Outlet
+1. **Waveform** (signal) - Generated output
 
-1. **LFO Output** (signal) - Shaped and smoothed ramp signal
+## Attributes
 
-## Parameters
+- `@mode` - Ramp mode: 0=AD, 1=Loop (default), 2=AR
 
-### Message Control
-- `frequency <float>` - LFO frequency in Hz (0.001-100.0, default: 1.0)
-- `slope <float>` - Attack/decay ratio 0-1 (0=fast attack, 1=fast decay, default: 0.5)
-- `mode <int>` - Ramp mode: 0=AD, 1=Loop, 2=AR (default: 1=Loop)
-- `trigger` or `bang` - Manually trigger envelope in AD/AR modes
+## Usage Examples
 
-### Arguments
-Object can be created with optional arguments: `tide~ [frequency] [slope] [mode]`
+```
+tide~ @mode 1        // LFO mode (continuous looping)
+tide~ @mode 0        // AD envelope (one-shot)
+tide~ @mode 2        // AR envelope (gate-controlled)
+```
 
-Examples:
-- `tide~` - Default: 1Hz, symmetric, loop mode
-- `tide~ 2.0` - 2Hz frequency
-- `tide~ 1.5 0.3` - 1.5Hz with fast attack/slow decay
-- `tide~ 0.5 0.7 0` - 0.5Hz with slow attack/fast decay in AD mode
+## Technical Implementation
 
-## Shape Parameter (Inlet 2)
+- **Architecture**: C wrapper around C++ DSP core using `extern "C"` pattern
+- **Algorithm**: Simplified recreation of Tides 2 PolySlopeGenerator
+- **Build**: Universal binary (x86_64 + ARM64) with CMake
+- **Dependencies**: None (self-contained implementation)
+- **Integration**: Demonstrates C++/Max external integration best practices
+- **Memory Management**: Opaque pointer pattern for safe C++ object lifecycle
 
-Morphs between 5 different curve shapes:
-- **0.0** - Linear ramp
-- **0.25** - Exponential (fast start, slow end)
-- **0.5** - Logarithmic (slow start, fast end)  
-- **0.75** - Sine curve (smooth S-curve)
-- **1.0** - Arc-sine (inverse S-curve)
+## Build Instructions
 
-Values between these points smoothly interpolate between curves.
+```bash
+cd source/audio/tide~
+mkdir build && cd build
+cmake -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" ..
+cmake --build .
 
-## Smoothness Parameter (Inlet 3)
+# For M1/M2 Macs, codesign the external
+codesign --force --deep -s - ../../../externals/tide~.mxo
+```
 
-Controls post-processing of the shaped ramp:
-- **0.0-0.5** - 2-pole low-pass filter (0.0=bypass, 0.5=20kHz cutoff)
-- **0.5-1.0** - Wavefolder (0.5=bypass, 1.0=maximum folding)
+### Build Requirements
 
-## Ramp Modes
+- CMake 3.19 or later
+- Xcode command line tools (macOS)
+- Max SDK base (included in repository)
 
-### Loop Mode (1) - Default
-Continuous looping ramp with asymmetric attack/decay based on slope parameter.
+### Verification
 
-### AD Mode (0) - One-shot
-Triggered envelope that runs attack then decay once per trigger.
-- Rising edge on inlet 1 starts envelope
-- Envelope runs to completion regardless of gate state
+```bash
+# Check universal binary
+file ../../../externals/tide~.mxo/Contents/MacOS/tide~
 
-### AR Mode (2) - Attack-Release  
-Gate-controlled envelope with sustain.
-- Rising edge starts attack phase
-- High gate sustains at peak
-- Falling edge starts release phase
+# Should output: 
+# Mach-O universal binary with 2 architectures: [x86_64] [arm64]
+```
 
-## Implementation Notes
+## Files
 
-### Algorithm Details
-- **Phase accumulator**: Asymmetric timing based on slope parameter
-- **Shape lookup tables**: 1024-point tables for each curve type
-- **Smoothness filter**: Butterworth 2-pole design with frequency mapping
-- **Wavefolder**: Triangle-wave folding algorithm with gain control
-
-### Performance
-- **Real-time safe**: No memory allocations in audio thread
-- **Optimized**: Efficient table lookups and parameter caching
-- **Thread safe**: Pure computational processing in perform routine
+- `tide~.c` - Main Max external implementation
+- `tides_wrapper.cpp` - C++ DSP algorithm wrapper
+- `CMakeLists.txt` - Build configuration
+- `README.md` - This documentation
 
 ## Usage Examples
 
 ### Basic LFO
 ```
-tide~ 1.0 0.5 1  // 1Hz symmetric loop
+[phasor~ 0.1]    // Set frequency to 0.1 Hz
+|
+[tide~ @mode 1]  // Loop mode LFO
+|
+[*~ 0.3]         // Scale output
+|
+[dac~]
 ```
 
 ### Envelope Generator
 ```
-tide~ 2.0 0.2 0  // Fast 2Hz attack-decay envelope
+[button]         // Manual trigger
+|
+[tide~ @mode 0]  // AD mode envelope
+|
+[*~]             // Apply to audio signal
+|  \
+|   [noise~]     // Audio source
+|
+[dac~]
 ```
 
-### Float Message Control
+### Shape Modulation
 ```
-// Send float messages to control parameters
-[2.0( -> [tide~]  // Frequency 2Hz via inlet 1
-[0.5( -> [tide~]  // Shape parameter via inlet 2
-[0.3( -> [tide~]  // Smoothness parameter via inlet 3
-```
-
-### Modulated Waveshaper
-```
-// Connect shape and smoothness modulation
-phasor~ 0.1 -> tide~ 1.0 0.3 1
-```
-
-### Triggered Envelope
-```
-// Manual triggering for envelopes
-[trigger( -> [tide~ 2.0 0.3 0]  // AD mode
-[bang( -> [tide~ 1.5 0.6 2]     // AR mode
+[phasor~ 0.05]   // Slow modulation
+|
+[tide~]          // Modulation LFO
+|
+[scale 0. 1. 0. 1.]  // Scale to shape range
+|
+[send shape]
+|
+[receive shape]
+|
+[tide~ @mode 1]  // Main LFO with modulated shape
+|
+[dac~]
 ```
 
-## Technical Specifications
+## Parameter Details
 
-- **Sample rate**: Any supported by Max/MSP
-- **Bit depth**: 64-bit double precision processing
-- **Latency**: Zero latency
-- **CPU usage**: Optimized for real-time performance
-- **Architecture**: Universal binary (Intel + Apple Silicon)
+### Shape Parameter (0-1)
+- **0.0-0.4**: Exponential curves (fast start, slow end)
+- **0.5**: Linear ramp (triangle wave in Loop mode)
+- **0.6-1.0**: Logarithmic curves (slow start, fast end)
 
----
+### Slope Parameter (0-1)  
+- **0.0**: Fast attack, slow decay (sawtooth-like)
+- **0.5**: Balanced attack/decay (triangle wave)
+- **1.0**: Slow attack, fast decay (reverse sawtooth)
 
-## Development Credits
+### Smooth Parameter (0-1)
+- **0.0-0.5**: Low-pass filtering (increasingly smooth)
+- **0.5**: No processing (clean signal)
+- **0.5-1.0**: Triangle wave folding (increasingly complex)
 
-**Algorithm Research**: Based on Mutable Instruments (Émilie Gillet) Tides specifications and community documentation  
-**Implementation**: Clean-room development using Max SDK patterns  
-**AI Assistant**: [Claude Code](https://claude.ai/code) for implementation and documentation  
-**Max SDK**: [Cycling '74 Max SDK](https://github.com/Cycling74/max-sdk) framework  
+## Development Notes
 
-*Captures the essence of Tides' unique character through original algorithmic interpretation!*
+This implementation demonstrates several advanced Max SDK patterns:
+
+1. **C++ Integration**: Clean separation between Max C interface and C++ DSP core
+2. **Opaque Pointers**: Safe C++ object management in C structures
+3. **Algorithm Recreation**: Simplified implementation capturing essential behavior
+4. **Universal Binary**: Cross-architecture compatibility with CMake
+5. **Signal/Float Handling**: Proper dual-inlet parameter control
+
+For detailed development information, see `CLAUDE.md` in this directory.
+
+## Compatibility
+
+- **Max/MSP**: Version 8.0 or later
+- **macOS**: 10.14 or later (universal binary includes Intel and Apple Silicon)
+- **Windows**: Not currently supported (would require additional build configuration)
+
+## See Also
+
+- **Original Hardware**: Mutable Instruments Tides 2 module
+- **Max SDK**: Documentation for mixed C/C++ externals
+- **Related Externals**: `slewenv~` for envelope generation patterns
+- **Help File**: `tide~.maxhelp` for interactive examples
