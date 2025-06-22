@@ -103,6 +103,17 @@ public:
         filter_lp_2_ = 0.0f;
     }
     
+    void ResetPhase() {
+        // Reset phase to 0 for synchronization
+        phase_ = 0.0;
+        ramp_value_ = 0.0f;
+        rising_ = true;
+        
+        // Optionally reset filter states for clean restart
+        filter_lp_1_ = 0.0f;
+        filter_lp_2_ = 0.0f;
+    }
+    
     void Render(
         RampMode ramp_mode,
         OutputMode output_mode,
@@ -330,6 +341,12 @@ void tides_destroy(void* tides_obj) {
 void tides_init(void* tides_obj) {
     if (tides_obj) {
         static_cast<tides::PolySlopeGenerator*>(tides_obj)->Init();
+    }
+}
+
+void tides_reset_phase(void* tides_obj) {
+    if (tides_obj) {
+        static_cast<tides::PolySlopeGenerator*>(tides_obj)->ResetPhase();
     }
 }
 

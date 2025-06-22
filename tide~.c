@@ -18,6 +18,7 @@ extern "C" {
 void* tides_create(void);
 void tides_destroy(void* tides_obj);
 void tides_init(void* tides_obj);
+void tides_reset_phase(void* tides_obj);
 void tides_render(void* tides_obj, int ramp_mode, int output_mode, int range,
                   float frequency, float pw, float shape, float smoothness, float shift,
                   unsigned char gate_flags, float* output);
@@ -54,6 +55,9 @@ typedef struct _tide
     // Gate flags (unused in loop mode but needed for Tides interface)
     unsigned char gate_flags;       // Tides gate flags
     
+    // Phase reset flag
+    short reset_phase;              // 1 to reset phase on next sample
+    
     // Sample rate
     double sample_rate;
     
@@ -64,6 +68,7 @@ void* tide_new(t_symbol* s, long argc, t_atom* argv);
 void tide_free(t_tide* x);
 void tide_assist(t_tide* x, void* b, long m, long a, char* s);
 void tide_float(t_tide* x, double f);
+void tide_bang(t_tide* x);
 void tide_dsp64(t_tide* x, t_object* dsp64, short* count, double samplerate, long maxvectorsize, long flags);
 void tide_perform64(t_tide* x, t_object* dsp64, double** ins, long numins, double** outs, long numouts, long sampleframes, long flags, void* userparam);
 
@@ -79,6 +84,7 @@ void ext_main(void* r)
     t_class* c = class_new("tide~", (method)tide_new, (method)tide_free, (long)sizeof(t_tide), 0L, A_GIMME, 0);
 
     class_addmethod(c, (method)tide_float, "float", A_FLOAT, 0);
+    class_addmethod(c, (method)tide_bang, "bang", 0);
     class_addmethod(c, (method)tide_dsp64, "dsp64", A_CANT, 0);
     class_addmethod(c, (method)tide_assist, "assist", A_CANT, 0);
     
@@ -130,6 +136,7 @@ void* tide_new(t_symbol* s, long argc, t_atom* argv)
         x->phase_has_signal = 0;
         
         x->gate_flags = 0;
+        x->reset_phase = 0;
         x->sample_rate = 44100.0;
 
         // Process attributes
@@ -157,7 +164,7 @@ void tide_assist(t_tide* x, void* b, long m, long a, char* s)
 {
     if (m == ASSIST_INLET) {
         switch (a) {
-            case 0: strcpy(s, "(signal/float) Frequency (Hz)"); break;
+            case 0: strcpy(s, "(signal/float/bang) Frequency (Hz) / Reset Phase"); break;
             case 1: strcpy(s, "(signal/float) Shape (0-1)"); break;
             case 2: strcpy(s, "(signal/float) Slope (0-1)"); break;
             case 3: strcpy(s, "(signal/float) Smooth (0-1)"); break;
@@ -197,6 +204,17 @@ void tide_float(t_tide* x, double f)
 
 //----------------------------------------------------------------------------------------------
 
+void tide_bang(t_tide* x)
+{
+    // Reset phase to 0 for synchronization
+    // Check which inlet received the bang (should be inlet 0 for frequency/reset)
+    long inlet = proxy_getinlet((t_object*)x);
+    
+    if (inlet == 0) {  // Frequency inlet accepts bangs for phase reset
+        x->reset_phase = 1;  // Set flag to reset phase on next audio sample
+        post("tide~: phase reset");
+    }
+}
 
 //----------------------------------------------------------------------------------------------
 
@@ -251,6 +269,12 @@ void tide_perform64(t_tide* x, t_object* dsp64, double** ins, long numins, doubl
         float norm_frequency = (float)(current_freq / x->sample_rate);
         norm_frequency = CLAMP(norm_frequency, 0.0f, 0.5f);  // Remove lower limit
 
+        // Handle phase reset from bang message
+        if (x->reset_phase) {
+            tides_reset_phase(x->poly_slope_generator);
+            x->reset_phase = 0;  // Clear the flag
+        }
+        
         // No gate detection needed for loop mode - just clear flags
         x->gate_flags = 0;
 
